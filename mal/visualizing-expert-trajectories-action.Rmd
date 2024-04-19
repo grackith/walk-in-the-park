@@ -1,0 +1,148 @@
+---
+title: "visualizing-expert-trajectories-action"
+author: "Grace Douglas"
+date: "2024-04-03"
+output: html_document
+---
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(naniar)
+library(readr)
+library(stars)
+library(spacetime)
+library(magrittr)
+library(sftime)
+library(stplanr)
+library(lubridate)
+
+library(xts) # For handling time series data
+library(lubridate) # For date-time manipulation
+knitr::opts_chunk$set(out.width="800px", dpi=80)
+
+setwd("~/imitation/mal-proj/mal/")
+```
+
+## bring trajectories in and combine
+
+```{r}
+# ids to keep from above cleaning
+
+action = st_read("~/imitation/mal-proj/greenlake/action-gl.shp") %>%
+  st_transform(int, crs = 4326) %>% 
+  tibble::rowid_to_column()
+names(action) = tolower(names(action))
+
+trac <- st_read("~/imitation/mal-proj/greenlake/trac-gl.shp") %>%
+  st_transform(crs = 4326) %>%
+  tibble::rowid_to_column() 
+names(trac) = tolower(names(trac))
+
+action = action %>%
+  dplyr::select(-run, -axis1_mean, -median_spe, -is_tour, -n_records, -pct_record, -dist_m_sta, -n_records_) %>%
+  rename(boutnum__1 =lmpaboutnu)
+
+trac = trac %>%
+  dplyr::select(-has_tlog, -overlaps_w, -overlaps_n, -overlaps_a, -is_complet, -has_comple, -valid_10h_, -cpm_mean)%>%
+  rename(tmin = time_pa_10,
+         tmax = time_pa_01,
+         calendar_d = jdaya)
+
+# Deactivate geometry columns
+action_df <- action %>% st_drop_geometry()
+trac_df <- trac %>% st_drop_geometry()
+
+#trac_df_reordered <- trac_df[, action_df$columns]
+# walk <- merge(action_df, trac_df)
+# walk <- sp::merge(action_df, trac_df)
+
+walk = rbind(action, trac)
+
+# Reactivate geometry columns
+st_geometry(walk) <- c(action$geometry, trac$geometry)
+
+```
+
+
+## fix missing geometry
+```{r}
+walk = walk %>%
+  st_transform(int, crs = 4326)
+#dim : 42699    14
+
+#filter empty geometries out by surrogate variable radius_mbc as to not disrupt current geometry
+walk = walk %>% filter(!is.na(radius_mbc))
+```
+
+## filter transit users out
+```{r}
+walk = walk %>% filter(is_transit != "1" & is_transit != "T") %>% dplyr::select(-is_transit)
+
+dim(walk)
+length(unique(walk$id))
+```
+
+
+# we must select a number of experts
+## but what is the task? 
+
+- discriminator can distinguish between expert demonstration and 
+- preferential path-planning: 
+  - runners vs walkers? 
+  - pt.a -> pt.b: go *around* greenlake
+  - classify: `util` variable 
+5 levels: 
+  nonwalk
+  rec_gps_loop
+  rec_tour      
+  unknown    
+  util
+
+```{r}
+# walk %>%
+#   group_by(id) %>%
+#   summarise(n = n()) %>%
+#   arrange(desc(n), .by_group = TRUE) %>%
+#   ggplot(mapping = aes(x = reorder(factor(id), -n), y = n)) + 
+#   geom_col() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+walk <- st_zm(walk, drop = TRUE) # Drop Z coordinate
+#st_write(walk, "~/imitation/mal-proj/mal/for-smoothing-qgis.shp")
+```
+
+
+# there is not much speed information missing, but we should impute the 0 values
+```{r}
+library(mice)
+walk$mean_speed[walk$mean_speed==0] = NA # specify mean_speed == 0 as NA
+walk$walk_type = as.factor(walk$walk_type) # factorize
+walk$rec_util = as.factor(walk$rec_util) # factorize
+walk$id = as.factor(walk$id)
+walk$rowid = as.factor(walk$rowid)
+walk_mice = walk %>% dplyr::select(-id) %>% st_drop_geometry()
+
+
+base <- mice(walk_mice[,-1], maxit=0) # run once with 0 imputations to compute the predM dichotomous matrix
+predM = base$predictorMatrix
+meth = base$method
+imp = mice(walk_mice[,-1], maxit = 5, 
+             predictorMatrix = predM, 
+             method = meth, print =  TRUE)
+walk_impute = mice::complete(imp, action = 5L, include = FALSE)
+dim(walk_impute)
+dim(walk)
+
+walk_impute$rowid = walk$rowid
+walk_impute$id = walk$id
+st_geometry(walk_impute) = st_geometry(walk)
+
+#st_write(walk_impute, "~/imitation/mal-proj/mal/fromR-for-qgis-smoothing-v2.shp")
+
+```
+
+
+
+

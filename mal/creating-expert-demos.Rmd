@@ -1,0 +1,175 @@
+---
+title: "creating-expert-demos"
+author: "Grace Douglas"
+date: "2024-04-03"
+output: html_document
+---
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(naniar)
+library(readr)
+library(stars)
+library(spacetime)
+library(magrittr)
+library(sftime)
+library(stplanr)
+library(lubridate)
+library(dplyr)
+library(xts) # For handling time series data
+library(lubridate) # For date-time manipulation
+knitr::opts_chunk$set(out.width="800px", dpi=80)
+library(tidyr)
+
+setwd("~/imitation/mal-proj/mal/")
+bouts <- st_read("~/imitation/mal-proj/april 11/bouts-1ft-samplingv2.shp")  %>%
+  st_transform(crs = 4326)
+
+```
+
+
+
+```{r}
+# Rename duplicated column names to make them unique
+bouts = bouts %>%
+  rename(ft_s = tf_s)
+
+#what frequency are we at
+sampling_rates <- bouts %>%
+  group_by(rowid) %>%
+  summarise(sampling_rate = mean(cngfeet / ft_s, na.rm = TRUE))
+
+bouts = bouts %>% filter(!is.na(id))
+bouts
+
+
+# Convert 'tmin' and 'tmax' to POSIXct format
+bouts$tmin <- ymd_hms(bouts$tmin)
+bouts$tmax <- ymd_hms(bouts$tmax)
+
+# Calculate the time difference between 'tmin' and 'tmax'
+bouts$duration_sec <- as.numeric(difftime(bouts$tmax, bouts$tmin, units = "secs"))
+
+bouts = bouts[1:200,]
+
+# Create a sequence of timestamps for each 'id' based on 'tmin', 'tmax', and 'fid'
+bouts <- bouts %>%
+  group_by(id) %>%
+  mutate(
+    timestamp = purrr::
+      map2(tmin, tmax, ~seq.POSIXt(from = .x, to = .y, length.out = length(fid))),
+    timestamp = unlist(timestamp)
+  ) %>%
+  ungroup()
+
+# Calculate the time difference between consecutive timestamps
+bouts <- bouts %>%
+  arrange(id, fid) %>%
+  mutate(
+    time_diff_sec = c(0, diff(timestamp)),
+    speed = mean_speed * 1000 / 3600  # Convert mean speed from kilometers per hour to meters per second
+  )
+
+# Interpolate the distance covered for each 'fid'
+bouts$distance_covered <- ave(bouts$cngfeet, bouts$id, FUN = cumsum)
+
+# Calculate the distance covered in each time interval
+bouts$distance_diff <- c(0, diff(bouts$distance_covered))
+
+# Calculate the time taken to cover each distance increment
+bouts$time_increment <- bouts$distance_diff / bouts$speed
+
+# Calculate the cumulative time taken
+bouts$cumulative_time <- cumsum(bouts$time_increment)
+
+# Add the cumulative time to the initial timestamp to get the extrapolated timestamp for each 'fid'
+bouts$extrapolated_timestamp <- bouts$timestamp[1] + bouts$cumulative_time
+
+# Select relevant columns
+result <- bouts %>%
+  select(id, fid, extrapolated_timestamp, speed) %>%
+  distinct()  # Remove duplicated rows
+
+# View the resulting dataframe
+print(result)
+
+```
+
+
+## reconstruct each bout using tmin, tmax pairs, duration_m, n and sf.geo
+
+[Linestring to points](https://docs.ropensci.org/stplanr/reference/line2points.html) 
+The points corresponding with a given line, i, will be $(2*i):((2*i)+1)$
+
+order of operations:
+1. make loess curve for each linestring
+2. resample at 1 second intervals from lowess curve for each linestring
+3. compute speed between 1 second lowess curve points (average speed will be same as original traversal, but speed along points will vary)
+
+Loess stands for locally estimated scatterplot smoothing (lowess stands for locally weighted scatterplot smoothing) and is one of many non-parametric regression techniques, but arguably the most flexible.
+
+```{r, fig.width=10, fig.height=10}
+bout = walk
+bout_pts <- line2pointsn(walk) #row.names are pts in linestring
+plot(bout$geometry)
+plot(bout_pts$geometry, add = TRUE)
+
+time_step <- 1 # in seconds
+#walk$datetime <- ymd_hms(walk$tmin)
+
+```
+
+
+## snap gps traces to osm grid - DO NOT DO THIS.
+
+> snapping to osm conforms to osm grid --> loosing all individual preferential micro route-planning (i.e., jaywalk)
+
+
+```{r, eval = FALSE}
+library(sf)
+library(dplyr)
+library(tidygeocoder)
+library(mapboxapi)
+library(hereR)
+library(osrm)
+library(leaflet)
+token = "pk.eyJ1IjoiZ3JhY2tpdGgiLCJhIjoiY2x1cm56bDZoMDljNTJtbDYzZGk1NGdmMCJ9.dYt96hiPMofNjlPoF5VAYA"
+#mb_access_token(token, install = TRUE, overwrite=TRUE)
+#Sys.getenv("MAPBOX_PUBLIC_TOKEN")
+get_mb_access_token()
+
+osroute <- osrm::osrmRoute(loc = walk,
+                           returnclass = "sf")
+
+#must split into rows before feeding
+mroute <- mapboxapi::mb_directions(input_data = walk,
+                                   profile = "walking")
+
+leaflet(osroute) %>%
+  addMapboxTiles(
+    style_id = "light-v9",
+    username = "mapbox"
+  ) %>%
+  addPolylines()
+```
+
+
+
+## interpolate points to get a timeseries by time-step
+
+```{r}
+interpolated_points <- st_interpolate(walk$geometry, n = 100)
+
+```
+
+
+
+```{r}
+glimpse(traj_raw_slow)
+lo <- loess(y~duration_min)
+plot(x,y)
+lines(predict(lo), col='red', lwd=2)
+```
+
